@@ -7,6 +7,8 @@ import os
 from discord.ext import tasks, commands
 from dotenv import load_dotenv
 from datetime import datetime
+import sqlite3 # oh no it has a database now
+from cyptography.fernet import Fernet # and cryptography why
 
 # Read config from .env file
 load_dotenv()
@@ -18,14 +20,19 @@ gatedWords=os.getenv('gatedWords').split(",")
 forbiddenWords=os.getenv('forbiddenWords').split(",")
 cleanupThreshold=float(os.getenv('cleanupThreshold'))
 apiKey=os.getenv('apiKey')
+encryptionKey=os.getenv('encryptionKey')
 
 # Sets base path (current directory)
 os.chdir(basePath)
 
 # Main bot class
 class KMergeBoxBot(discord.Client):
-    def __init__(self, command_prefix, intents):
+    def __init__(self, command_prefix, intents, db_cursor):
         super().__init__(command_prefix=command_prefix, intents=intents)
+        self.db_cursor = db_cursor
+        
+        #Encryption Setup
+        self.cipher_suite = Fernet(encryptionKey)
         
     # List of current / ongoing tasks
     currentTasks = {}
@@ -130,7 +137,40 @@ class KMergeBoxBot(discord.Client):
     # @is_message_for_me()
     # async def hf(ctx, args)
         # return
-            
+        
+    @self.command()
+    @dm_only()
+    async def hftoken(ctx, args)
+        if len(args) != 1
+            await ctx.author.send(f"Too many arguments - just the token, please.")
+            return
+        if args[0][:3] != 'hf_':
+            await ctx.author.send(f"That doesn't look like a valid hf token, it should begin 'hf_'. Please confirm and try again.")
+            return
+        
+        # Encrypt and store the hf token in the database, keyed to the user's ID; overwriting existing 
+        encrypted_token = cipher_suite.encrypt(args[0].encode())
+        self.db_cursor.execute('INSERT OR REPLACE INTO hf_tokens (user_id, hf_token) VALUES (?, ?)', (ctx.author.id, encrypted_token))
+        
+        # Notify user, with a sanity check that converts back the stored data to ensure it looks right. Then remove the value after 15 seconds.
+        message = await ctx.author.send(f"HF token for <@{ctx.author.id}> updated to {cipher_suite.decrypt(encrypted_token).decode} and encrypted.")
+        await asyncio.sleep(15)
+        await message.edit(f"HF token for <@{ctx.author.id}> updated to <censored> and encrypted.")
+        return
+    # Handle someone trying to use the command in a channel anyway
+    @hftoken.error
+    async def hftoken_error(ctx, error):
+        if isinstance(error, PrivateMessageOnly): 
+            # If the bot can delete their message, do so
+            if ctx.channel.permissions_for(ctx.me).manage_messages
+                await ctx.message.delete()
+                await message = ctx.channel.send(f"{ctx.author.mention} - that command only works in DMs for security reasons.")
+                await message.delete(delay=15)
+            # Otherwise ~~scold~~ alert the user
+            else
+                await ctx.channel.reply(f"That command only works in DMs for security reasons, you might want to delete that and generate a new token.")
+                await message.delete(delay=15)
+        
     @self.command()
     @is_message_for_me()
     async def status(ctx, args)
@@ -220,9 +260,22 @@ class KMergeBoxBot(discord.Client):
             asyncio.ensure_future(self.cleanup_space())
         return
 
+# Make database connection
+conn = sqlite3.connect('user_data.db')
+c = conn.cursor()
+
+# Create table if it doesn't exist
+c.execute('''CREATE TABLE IF NOT EXISTS hf_tokens
+             (user_id INT PRIMARY KEY, hf_token TEXT)''')
+c.execute('''CREATE TABLE IF NOT EXISTS previous_jobs
+             (user_id INT FOREIGN KEY, job_name TEXT)''')
+                          
+             
+conn.commit()
+    
 # Runs the merge bot with the provided API key
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = KMergeBoxBot(command_prefix='!', intents=intents)
+bot = KMergeBoxBot(command_prefix='!', intents=intents, db_cursor=c)
 bot.run(apiKey)
