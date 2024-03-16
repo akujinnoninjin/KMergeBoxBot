@@ -5,8 +5,7 @@ import os
 from discord.ext import tasks, commands
 from dotenv import load_dotenv
 from datetime import datetime
-import sqlite3 # oh no it has a database now
-from cyptography.fernet import Fernet # and cryptography why
+
 
 # Read config from .env file
 load_dotenv()
@@ -19,19 +18,23 @@ forbiddenWords=os.getenv('forbiddenWords').split(",")
 cleanupThreshold=float(os.getenv('cleanupThreshold'))
 apiKey=os.getenv('apiKey')
 
-# HF upload mode env variables
-enableHF=os.getenv('enableHF')
-encryptionKey=os.getenv('encryptionKey')
-
-# Job history mode env variables
-enableHistory = os.getenv('enableHistory')
-
 allowedCommands=os.getenv('allowedCommands').split(",") # Suggest: Regen, Status, Generate
 privilegedCommands=os.getenv('privelegedCommands').split(",") # Suggest: HF Upload, HF Token
-privilegedRoles=os.getenv('privilegedRoles').split(",")
+privilegedRoles=int(os.getenv('privilegedRoles').split(","))
 adminCommands=os.getenv('adminCommands').split(",") # Suggest: Anything DB manipulatey
-adminRoles=os.getenv('adminRoles').split(",")
+adminRoles=int(os.getenv('adminRoles').split(","))
 
+# HF upload mode env variables and import
+enableHF=bool(os.getenv('enableHF'))
+encryptionKey=os.getenv('encryptionKey')
+if enableHF:
+    from cyptography.fernet import Fernet # and cryptography why
+
+# Job history mode env variables and import
+enableHistory = bool(os.getenv('enableHistory'))
+if enableHistory or enableHF:
+    import sqlite3 # oh no it has a database now
+    
 # Sets base path (current directory)
 os.chdir(basePath)
 
@@ -53,7 +56,7 @@ class KMergeBoxBot(discord.Client):
 
     # Start the merge watcher / runner in the background
     async def setup_hook(self) -> None:
-        self.runMerges.start()
+        self.run_jobs.start()
 
     # Log the logon event
     async def on_ready(self):
@@ -78,13 +81,15 @@ class KMergeBoxBot(discord.Client):
             return True
         # If it didn't appear on any of the three lists, the command is disabled
         return False
-        
+    
+    # Is the command destined for the bot?
     def is_message_for_me():
         async def predicate(ctx):
             # Only return true if command didn't come from the bot and is in correct channel
             return not ctx.author.id == ctx.bot.user.id and ctx.channel.id == channelToListenOn
         return commands.check(predicate)
-        
+
+    # Does the user have existing tasks queued?
     def user_has_no_existing_tasks():
         async def predicate(ctx):
             # Return true if user ID is not already in the task list
@@ -95,12 +100,14 @@ class KMergeBoxBot(discord.Client):
             return False              
         return commands.check(predicate)
     
+    # Does the message have only a single yaml attachment?
     def message_has_valid_yaml_attachment():
         async def predicate(ctx):
             # Message should only have one attachment, and it shoud be a yaml
             return len(ctx.message.attachments) == 1 and ctx.message.attachments[0].filename.lower().endswith(".yaml")
         return commands.check(predicate)    
         
+    # Is the HF module enabled?
     def is_hf_enabled():
         async def predicate(ctx):
             # Disable command if hf is not enabled
@@ -119,32 +126,46 @@ class KMergeBoxBot(discord.Client):
         print(f'Rerunning {args[0]} submitted from {ctx.author}')
         await ctx.channel.send(f'Rerunning {args[0]} submitted from {ctx.author}')
         return
-     
+    
     # !generate command
-    # Takes an attachment and an optional "update" flag to overwrite an existing yaml if the user owns it. 
+    # Takes an attachment. 
     @self.command()
     @is_message_for_me()
-    @user_has_no_existing_tasks()
     @message_has_valid_yaml_attachment()
+    @user_has_no_existing_tasks()
     async def generate(ctx, args)
-        attachment = ctx.message.attachments[0]
-        locToSaveTo = path.join(basePath,attachment.filename)
+        make_a_merge_task(self, ctx.message)
+
+    # Automated gen on yaml attachment
+    async def on_message(self, message):
+        if message.channel.id == channelToListenOn                          # in right channel?
+           and message.author.id != self.user.id                            # not self?
+           and message.attachments                                          # has attachments?
+           and len(message.attachments) == 1                                # has only 1 attachment?
+           and message.attachments[0].filename.lower().endswith(".yaml")    # it's a yaml?
+           and not ctx.author.id in self.currentTasks.keys()                # and they don't have...
+           and not ctx.author.id in self.currentLowPriorityTasks.keys():    # ...existing tasks
+           make_a_merge_task(self, message)
     
+    # Shared merge task creator, called by on_message and !generate
+    async def make_a_merge_task(self, message)
+        attachment = message.attachments[0]
+        locToSaveTo = path.join(basePath,attachment.filename)
         # If the named merge already has been run, respond with an error
         if path.exists(locToSaveTo):
-            await ctx.channel.send(f'The file {attachment.filename} already has been merged before. Please choose a different name {ctx.author.mention}.')
+            await message.channel.send(f'The file {attachment.filename} already has been merged before. Please choose a different name {message.author.mention}.')
             return
             
         # If the file contains gated words, then don't do the merge unless the user has the designated role and even then run at lower priority
         data = (await attachment.read()).decode("utf-8")
         isGated = any(word in data.lower() for word in gatedWords)
-        if isGated and not any(role.id == gatedWordsRole for role in ctx.author.roles):
-            await ctx.channel.send(gatedWordsError)
+        if isGated and not any(role.id == gatedWordsRole for role in message.author.roles):
+            await message.channel.send(gatedWordsError)
             return
             
         # If the file contains banned words, don't run it
         if any(word in data.lower() for word in forbiddenWords):
-            await ctx.channel.send(f'The file {attachment.filename} contains forbidden words and cannot be run.')
+            await message.channel.send(f'The file {attachment.filename} contains forbidden words and cannot be run.')
             return
 
         # Save the attachment
@@ -156,45 +177,81 @@ class KMergeBoxBot(discord.Client):
 
         # Add merge job to queue and then respond to requester
         if isGated:
-            self.currentLowPriorityTasks[ctx.author.id] = attachment.filename
+            self.currentLowPriorityTasks[message.author.id] = attachment.filename
         else:
-            self.currentTasks[ctx.author.id] = attachment.filename
+            self.currentTasks[message.author.id] = attachment.filename
 
-        print(f'Attachment submitted from {ctx.author}: {ctx.message.content} and saved to {locToSaveTo}')
-        await ctx.channel.send(f'Task submitted for {ctx.author.mention}: {attachment.filename}')
+        print(f'Attachment submitted from {message.author}: {message.content} and saved to {locToSaveTo}')
+        await message.channel.send(f'Task submitted for {message.author.mention}: {attachment.filename}')
         return
-    
-    # @self.command()
-    # @is_message_for_me()
-    # @is_hf_enabled()
-    # async def hfupload(ctx, args)
-        # return
-    
-    #!hftoken command
-    #Takes one argument (the hf token), encrypts it, and adds it to the database. Only works over DMs.
+        
+    @self.command()
+    @is_message_for_me()
+    @is_hf_enabled()
+    @user_has_no_existing_tasks()
+    async def hfupload(ctx, args)
+        if len(args==0):
+            job = args[0]
+            # Trim it, if they asked for the yaml
+            if job.lower().endswith(".yaml"):
+                job = job.rsplit(".", 1)[0]            
+            huggingface_upload(ctx.message, job)
+            return
+        # TODO: Deal with a malformed request here
+        return
+        
+    # Shared huggingface uploader, so can pull silly tricks with reactions later    
+    async def huggingface_upload(message, job)
+        if not enableHF:
+            print(f'Error - Upload requested, but huggingface mode disabled.')
+            return
+        
+        # Retrieve database info
+        self.dbCursor.execute("SELECT hf_name, hf_token FROM hf_tokens WHERE user_id = ?", (message.author.id))
+        result = c.fetchone()
+        if result:
+            username, apikey = result
+            apikey = cipherSuite.decrypt(apikey).decode
+            
+            # ToDo: Create a repo if it doesn't exist
+                  # Upload the folder in the background
+                    # Integrate with task manager?
+                    # Create *separate* task manager?
+                  # Close the connection
+                  # Let user know upload is complete
+        else:
+            await message.channel.send(f'No HF login info found for {message.author}: please send the bot a DM using `!hflogin name access_token`.')
+            return
+   
+    #!hflogin command
+    #Takes two arguments (hf name, hf acces token), encrypts the token, and stores both in the database. Only works over DMs.
     @self.command()
     @dm_only()
     @is_hf_enabled()
-    async def hftoken(ctx, args)
-        if len(args) != 1
-            await ctx.author.send(f"Too many arguments - just the token, please.")
+    async def hflogin(ctx, args)
+        if len(args) != 2
+            await ctx.author.send(f"Arguments should be 'hf_name access_token'.")
             return
-        if args[0][:3] != 'hf_':
-            await ctx.author.send(f"That doesn't look like a valid hf token, it should begin 'hf_'. Please confirm and try again.")
+        # if not validHFRepo(args[0] )
+            #await ctx.author.send(f"Invalid huggingface name.")
+            # call a validation routine to make sure it fits the repo style rules
+            # return
+        if args[1][:3] != 'hf_':
+            await ctx.author.send(f"Invalid hf token. It should begin 'hf_'. Please confirm and try again.")
             return
         
         # Encrypt and store the hf token in the database, keyed to the user's ID; overwriting existing 
         encryptedToken = cipherSuite.encrypt(args[0].encode())
-        self.dbCursor.execute('INSERT OR REPLACE INTO hf_tokens (user_id, hf_token) VALUES (?, ?)', (ctx.author.id, encryptedToken))
+        self.dbCursor.execute('INSERT OR REPLACE INTO hf_tokens (user_id, hf_name, hf_token) VALUES (?, ?, ?)', (ctx.author.id, args[0], encryptedToken))
         
         # Notify user, with a sanity check that converts back the stored data to ensure it looks right. Then remove the value after 15 seconds.
-        message = await ctx.author.send(f"HF token for <@{ctx.author.id}> updated to {cipherSuite.decrypt(encryptedToken).decode} and encrypted.")
+        message = await ctx.author.send(f"HF settings for <@{ctx.author.id}> updated to {args[0]} : {cipherSuite.decrypt(encryptedToken).decode} and encrypted.")
         await asyncio.sleep(15)
-        await message.edit(f"HF token for <@{ctx.author.id}> updated to <censored> and encrypted.")
+        await message.edit(f"HF token for <@{ctx.author.id}> updated to {args[0]} : <censored> and encrypted.")
         return
     # Handle someone trying to use the command in a channel anyway
-    @hftoken.error
-    async def hftoken_error(ctx, error):
+    @hflogin.error
+    async def hflogin_error(ctx, error):
         if isinstance(error, PrivateMessageOnly): 
             # If the bot can delete their message, do so
             if ctx.channel.permissions_for(ctx.me).manage_messages
@@ -306,6 +363,7 @@ if enableHistory or enableHF:
     if enableHF:
         c.execute('''CREATE TABLE IF NOT EXISTS hf_tokens
                      (user_id INT PRIMARY KEY,
+                      hf_name TEXT,
                       hf_token TEXT)''')
     if enableHistory:
         c.execute('''CREATE TABLE IF NOT EXISTS job_history
