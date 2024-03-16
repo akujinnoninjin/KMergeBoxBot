@@ -1,7 +1,5 @@
 import asyncio
 import shutil
-from os import path
-
 import discord
 import os
 from discord.ext import tasks, commands
@@ -20,7 +18,13 @@ gatedWords=os.getenv('gatedWords').split(",")
 forbiddenWords=os.getenv('forbiddenWords').split(",")
 cleanupThreshold=float(os.getenv('cleanupThreshold'))
 apiKey=os.getenv('apiKey')
+
 encryptionKey=os.getenv('encryptionKey')
+allowedCommands=os.getenv('allowedCommands').split(",") # Suggest: Regen, Status, Generate
+privilegedCommands=os.getenv('privelegedCommands').split(",") # Suggest: HF Upload, HF Token
+privilegedRoles=os.getenv('privilegedRoles').split(",")
+adminCommands=os.getenv('adminCommands').split(",") # Suggest: Anything DB manipulatey
+adminRoles=os.getenv('adminRoles').split(",")
 
 # Sets base path (current directory)
 os.chdir(basePath)
@@ -49,6 +53,26 @@ class KMergeBoxBot(discord.Client):
     async def on_ready(self):
         print(f'Logged on as {self.user}!')
  
+    # Is the user of an appropriate role for privileged commands
+    ## APPLIES TO ALL COMMANDS
+    @self.check
+    async def user_has_persimmons(ctx):
+        # If it's an admin command, check if they have the admin role
+        if ctx.command.name in adminCommands:
+            if any(role.id in ctx.author.roles for role in adminRoles)
+                return True
+            else return False
+        # If it's a privileged command, check if they have privileged role
+        if ctx.command.name in privilegedCommands:
+            if any(role.id in ctx.author.roles for role in privilegedRoles)
+                return True
+            else return False
+        # If it's an allowed command
+        if ctx.command.name in allowedCommands:
+            return True
+        # If it didn't appear on any of the three lists, the command is disabled
+        return False
+        
     def is_message_for_me():
         async def predicate(ctx):
             # Only return true if command didn't come from the bot and is in correct channel
@@ -59,10 +83,10 @@ class KMergeBoxBot(discord.Client):
         async def predicate(ctx):
             # Return true if user ID is not already in the task list
             if not ctx.author.id in self.currentTasks.keys() and not ctx.author.id in self.currentLowPriorityTasks.keys():
-               return true
+               return True
             # Otherwise notify and return false to abort the command
             await ctx.channel.send(f'{ctx.author.mention} has already submitted a pending task (please try and submit it again later): {self.currentTasks[ctx.author.id]}')   
-            return false              
+            return False              
         return commands.check(predicate)
     
     def message_has_valid_yaml_attachment():
@@ -70,6 +94,8 @@ class KMergeBoxBot(discord.Client):
             # Message should only have one attachment, and it shoud be a yaml
             return len(ctx.message.attachments) == 1 and ctx.message.attachments[0].filename.lower().endswith(".yaml")
         return commands.check(predicate)    
+    
+   
  
     # !regen command
     @self.command()
