@@ -19,7 +19,13 @@ forbiddenWords=os.getenv('forbiddenWords').split(",")
 cleanupThreshold=float(os.getenv('cleanupThreshold'))
 apiKey=os.getenv('apiKey')
 
+# HF upload mode env variables
+enableHF=os.getenv('enableHF')
 encryptionKey=os.getenv('encryptionKey')
+
+# Job history mode env variables
+enableHistory = os.getenv('enableHistory')
+
 allowedCommands=os.getenv('allowedCommands').split(",") # Suggest: Regen, Status, Generate
 privilegedCommands=os.getenv('privelegedCommands').split(",") # Suggest: HF Upload, HF Token
 privilegedRoles=os.getenv('privilegedRoles').split(",")
@@ -94,9 +100,13 @@ class KMergeBoxBot(discord.Client):
             # Message should only have one attachment, and it shoud be a yaml
             return len(ctx.message.attachments) == 1 and ctx.message.attachments[0].filename.lower().endswith(".yaml")
         return commands.check(predicate)    
-    
-   
- 
+        
+    def is_hf_enabled():
+        async def predicate(ctx):
+            # Disable command if hf is not enabled
+            return enableHF
+        return commands.check(predicate)
+        
     # !regen command
     @self.command()
     @is_message_for_me()
@@ -119,23 +129,9 @@ class KMergeBoxBot(discord.Client):
     async def generate(ctx, args)
         attachment = ctx.message.attachments[0]
         locToSaveTo = path.join(basePath,attachment.filename)
-        jobName = attachment.filename.rsplit(".", 1)[0]
-        updateAllowed = False
-        
-        # If user has requested to update the existing file
-        if args[0].lower() == "update"
-            # Lookup who owns the job
-            jobOwner = self.dbCursor.execute("SELECT user_id FROM job_history WHERE job_name = ?", (jobName))
-            # If they own don't own it, deny them
-            if jobOwner != None and jobOwner != ctx.author.id:
-                await ctx.channel.send(f'Cannot update {attachment.filename}, it belongs to {get_user(jobOwner)}.') 
-                return
-            updateAllowed = True
-
-        ## ISSUE: Existing YAML will have jobOwner None, allowing *anyone* to overwrite them with Update, and take ownership of them in the process.
-
+    
         # If the named merge already has been run, respond with an error
-        if path.exists(locToSaveTo) and not updateAllowed:
+        if path.exists(locToSaveTo):
             await ctx.channel.send(f'The file {attachment.filename} already has been merged before. Please choose a different name {ctx.author.mention}.')
             return
             
@@ -155,7 +151,8 @@ class KMergeBoxBot(discord.Client):
         await attachment.save(locToSaveTo)
         
         # Add the job to the database for the user
-        self.dbCursor.execute('INSERT INTO job_history (user_id, job_name) VALUES (?, ?)', (ctx.author.id, attachment.filename))
+        if enableHistory:
+            self.dbCursor.execute('INSERT INTO job_history (user_id, job_name) VALUES (?, ?)', (ctx.author.id, attachment.filename.rsplit(".", 1)[0]))
 
         # Add merge job to queue and then respond to requester
         if isGated:
@@ -166,21 +163,18 @@ class KMergeBoxBot(discord.Client):
         print(f'Attachment submitted from {ctx.author}: {ctx.message.content} and saved to {locToSaveTo}')
         await ctx.channel.send(f'Task submitted for {ctx.author.mention}: {attachment.filename}')
         return
-        
-    # @self.command()
-    # @is_message_for_me()
-    # async def remove(ctx, args)
-        # return
     
     # @self.command()
     # @is_message_for_me()
-    # async def hf(ctx, args)
+    # @is_hf_enabled()
+    # async def hfupload(ctx, args)
         # return
     
     #!hftoken command
     #Takes one argument (the hf token), encrypts it, and adds it to the database. Only works over DMs.
     @self.command()
     @dm_only()
+    @is_hf_enabled()
     async def hftoken(ctx, args)
         if len(args) != 1
             await ctx.author.send(f"Too many arguments - just the token, please.")
@@ -301,22 +295,28 @@ class KMergeBoxBot(discord.Client):
             asyncio.ensure_future(self.cleanup_space())
         return
 
-# Make database connection
-conn = sqlite3.connect('user_data.db')
-c = conn.cursor()
 
-# Create table if it doesn't exist
-c.execute('''CREATE TABLE IF NOT EXISTS hf_tokens
-             (user_id INT PRIMARY KEY,
-              hf_token TEXT)''')
-c.execute('''CREATE TABLE IF NOT EXISTS job_history
-             (job_id INT PRIMARY KEY AUTOINCREMENT,
-              user_id INT,
-              job_name TEXT,
-              FOREIGN KEY(user_id) REFERENCES hf_tokens(user_id)
-              ON DELETE CASCADE)''')
 
-conn.commit()
+# Make database connection if enabled
+if enableHistory or enableHF:
+    conn = sqlite3.connect('user_data.db')
+    c = conn.cursor()
+
+    # Create DB tables if enabled:
+    if enableHF:
+        c.execute('''CREATE TABLE IF NOT EXISTS hf_tokens
+                     (user_id INT PRIMARY KEY,
+                      hf_token TEXT)''')
+    if enableHistory:
+        c.execute('''CREATE TABLE IF NOT EXISTS job_history
+                     (job_id INT PRIMARY KEY AUTOINCREMENT,
+                      user_id INT,
+                      job_name TEXT,
+                      FOREIGN KEY(user_id) REFERENCES hf_tokens(user_id)
+                      ON DELETE CASCADE)''')
+    conn.commit()
+else:
+    c = None
     
 # Runs the merge bot with the provided API key
 intents = discord.Intents.default()
