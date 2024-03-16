@@ -6,6 +6,7 @@ import discord
 import os
 from discord.ext import tasks, commands
 from dotenv import load_dotenv
+from datetime import datetime
 
 # Read config from .env file
 load_dotenv()
@@ -30,10 +31,8 @@ class KMergeBoxBot(discord.Client):
     currentTasks = {}
     # List of current low priority / ongoing tasks
     currentLowPriorityTasks = {}
-    # Is cleanup happening
-    currentlyCleaning = False
-    # Is a merge running
-    currentlyMerging = False
+    # Current merge title and timestamp
+    currentJob = ()
 
     # Start the merge watcher / runner in the background
     async def setup_hook(self) -> None:
@@ -117,7 +116,6 @@ class KMergeBoxBot(discord.Client):
         await ctx.channel.send(f'Task submitted for {ctx.author.mention}: {attachment.filename}')
         return
         
-    
     # @self.command()
     # @is_message_for_me()
     # async def replace(ctx, args)
@@ -136,92 +134,91 @@ class KMergeBoxBot(discord.Client):
     @self.command()
     @is_message_for_me()
     async def status(ctx, args)
-        if self.currentlyCleaning:
-            await ctx.channel.send(f'Currently running a cleanup job...')
-        else if self.currentlyMerging:
-            ## TODO: get current job info
-            await ctx.channel.send(f'Currently running a merge...')
+        if self.currentJob[0] is not None:
+            await ctx.channel.send(f'Currently {self.currentJob[0]}, started at {self.currentJob[1]}')
         else:
             await ctx.channel.send(f'Currently idle...')
         return 
-    
  
     @tasks.loop(seconds=10)
-    async def runMerges(self):
-        # Check disk space free
-        if self.currentlyCleaning == True:
+    async def run_jobs(self):
+        # Don't run jobs while cleaning or merging
+        if self.currentJob[0] is not None:
             return
-        total, used, free = shutil.disk_usage(__file__)
-        if (used / total > cleanupThreshold):
-            print("Running cleanup")
-            asyncio.ensure_future(self.cleanupSpace())
 
-        # If no jobs in queue, skip
-        if len(self.currentTasks.keys()) == 0 and len(self.currentLowPriorityTasks.keys()) == 0:
-            return
-        if self.currentlyMerging == True:
-            return
-        self.currentlyMerging = True
-        asyncio.ensure_future(self.runFirstItemInQueue())
+        # If either queue has a job, queue it up
+        if len(self.currentTasks.keys()) != 0 or len(self.currentLowPriorityTasks.keys()) != 0:
+            asyncio.ensure_future(self.run_first_item_in_queue())
+           
+        return
+    
+    # Waits for the user to be logged on before starting the run merges task
+    @runJobs.before_loop
+    async def before_run_jobs(self):
+        await self.wait_until_ready()
+        
 
-    async def cleanupSpace(self):
-        self.currentlyCleaning = True
-        # Declare the merge job command
-        commandToRun = f'sh ./cleanup.sh'
-        # Start up the merge process, piping outputs ready to be collected once complete
+    async def cleanup_space(self):
+        self.currentJob = ("cleaning", datetime.now().strftime("%m-%d %H:%M:%S")) 
+        print(f'Now {self.currentJob[0]}, started at {self.currentJob[1]}')
+        
+        # Start the cleanup job, piping outputs ready to be collected once complete
+        cleanupCommand = f'sh ./cleanup.sh'
+        process = await asyncio.create_subprocess_shell(cleanupCommand, stdout=asyncio.subprocess.PIPE,
+                                                        stderr=asyncio.subprocess.PIPE)
+        # Wait for the cleanup to complete, retrieve the outputs
+        stdout, stderr = await process.communicate()
+        
+        # Put the standard out and error into a single string, log to console
+        resultText = f'STDOUT: {stdout.decode()}, STDERR: {stderr.decode()}'
+        print(resultText)
+        
+        # Wait 30 seconds, then end the cleaning state
+        await asyncio.sleep(30)
+        self.currentJob = ()
+        return
+
+    async def run_first_item_in_queue(self):
+        # Get first task in the ordered dictionary
+        firstTask = next(iter(self.currentTasks.items()), next(iter(self.currentLowPriorityTasks.items()), ""))
+        
+        # Failsafe if somehow got here with an empty task list
+        if firstTask == "":
+            self.currentJob = ()
+            return
+        else:
+            nameWithoutExt = firstTask[1].replace('.yaml', '')
+            self.currentJob = ("running merge: " + nameWithoutExt, datetime.now().strftime("%m-%d %H:%M:%S"))
+            print(f'Now {self.currentJob[0]}, started at {self.currentJob[1]}')
+        
+        # Begin the merge job, piping outputs ready to be collected once complete
+        commandToRun = f'sh ./run.sh {nameWithoutExt}'
         process = await asyncio.create_subprocess_shell(commandToRun, stdout=asyncio.subprocess.PIPE,
                                                         stderr=asyncio.subprocess.PIPE)
         # Wait for the merge to complete (no logs will be printed yet)
         stdout, stderr = await process.communicate()
-        # Put the standard out and error into a single string
+        
+        # Put the standard out and error into a single string, log to console and file
         resultText = f'STDOUT: {stdout.decode()}, STDERR: {stderr.decode()}'
-        # Print to logs (console and file)
         print(resultText)
-        await asyncio.sleep(30)
-        self.currentlyCleaning = False
-
-    async def runFirstItemInQueue(self):
-        # Get first task in the ordered dictionary
-        firstTask = next(iter(self.currentTasks.items()), next(iter(self.currentLowPriorityTasks.items()), ""))
-        if firstTask == "":
-            self.currentlyMerging = False
-            return
-        attachment = firstTask[1]
-        # Get the name without the extension
-        nameWithoutExt = attachment.replace('.yaml', '')
-        print(f'Starting merge: {nameWithoutExt}')
-        # Declare the merge job command
-        commandToRun = f'sh ./run.sh {nameWithoutExt}'
-        # Start up the merge process, piping outputs ready to be collected once complete
-        process = await asyncio.create_subprocess_shell(commandToRun, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        # Wait for the merge to complete (no logs will be printed yet)
-        stdout, stderr = await process.communicate()
-        # Put the standard out and error into a single string
-        resultText = f'STDOUT: {stdout.decode()}, STDERR: {stderr.decode()}'
-        # Print to logs (console and file)
-        print(resultText)
-        locToSaveTo = path.join(basePath, 'log.txt')
-        with open(locToSaveTo, 'w') as fileToWrite:
+        logfile = path.join(basePath, 'log.txt')
+        with open(logfile, 'w') as fileToWrite:
             fileToWrite.write(resultText)
-        # Get the channel to respond to
-        channel = self.get_channel(channelToListenOn)
-        # Respond with the logs as an attachment
-        file = discord.File(locToSaveTo)
-        await channel.send(f'<@{firstTask[0]}> - {nameWithoutExt} has finished', file=file)
-        # Clear from the pending task queue
-        task = self.currentTasks.get(firstTask[0], None)
-        if task:
-            del self.currentTasks[firstTask[0]]
-        task = self.currentLowPriorityTasks.get(firstTask[0], None)
-        if task:
-            del self.currentLowPriorityTasks[firstTask[0]]
-        self.currentlyMerging = False
+            
+        # Notify user of end of job with logs as attachment
+        await self.get_channel(channelToListenOn).send(f'<@{firstTask[0]}> - {nameWithoutExt} has finished', file=discord.File(logfile))
+        
+        # Clear from the pending task queue and end the job
+        self.currentTasks.pop(firstTask[0], None)
+        self.currentLowPriorityTasks.pop(firstTask[0], None)
+        self.currentJob = ()
         print(f'Ending merge: {nameWithoutExt}')
-
-    # Waits for the user to be logged on before starting the run merges task
-    @runMerges.before_loop
-    async def before_my_task(self):
-        await self.wait_until_ready()
+        
+        # Run cleanup if needed
+        total, used, free = shutil.disk_usage(__file__)
+        if (used / total > cleanupThreshold):
+            asyncio.ensure_future(self.cleanup_space())
+        return
 
 # Runs the merge bot with the provided API key
 intents = discord.Intents.default()
