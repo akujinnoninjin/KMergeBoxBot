@@ -4,7 +4,7 @@ from os import path
 
 import discord
 import os
-from discord.ext import tasks
+from discord.ext import tasks, commands
 from dotenv import load_dotenv
 
 # Read config from .env file
@@ -23,6 +23,9 @@ os.chdir(basePath)
 
 # Main bot class
 class KMergeBoxBot(discord.Client):
+    def __init__(self, command_prefix, intents):
+        super().__init__(command_prefix=command_prefix, intents=intents)
+        
     # List of current / ongoing tasks
     currentTasks = {}
     # List of current low priority / ongoing tasks
@@ -39,55 +42,66 @@ class KMergeBoxBot(discord.Client):
     # Log the logon event
     async def on_ready(self):
         print(f'Logged on as {self.user}!')
-
-    async def on_message(self, message):
-        # If channel is not the one specified in the .env file, ignore
-        if not message.channel.id == channelToListenOn:
-            return
-        # If message sent from the bot, ignore
-        if message.author.id == self.user.id:
-            return
-
-        # If message is a command, then run a regen
-        splitCommand = message.content.split(" ")
-        if len(splitCommand) == 2 and splitCommand[0].lower() == "!regen":
-            # If requester has already submitted a task, respond with an error
-            if message.author.id in self.currentTasks.keys() or message.author.id in self.currentLowPriorityTasks.keys():
-                await message.channel.send(
-                    f'{message.author.mention} has already submitted a pending task (please try and submit it again later): {self.currentTasks[message.author.id]}')
-                return
-            self.currentTasks[message.author.id] = splitCommand[1]
-            print(f'Rerunning {splitCommand[1]} submitted from {message.author}')
-            await message.channel.send(f'Rerunning {splitCommand[1]} submitted from {message.author}')
-            return
-
-        # If message do not have exactly one attachment, ignore
-        if len(message.attachments) != 1:
-            return
-
-        # If requester has already submitted a task, respond with an error
-        if message.author.id in self.currentTasks.keys() or message.author.id in self.currentLowPriorityTasks.keys():
-            await message.channel.send(f'{message.author.mention} has already submitted a pending task (please try and submit it again later): {self.currentTasks[message.author.id]}')
-            return
-
-        attachment = message.attachments[0]
-        # If the attachment is not a yaml, ignore
-        if not attachment.filename.endswith(".yaml"):
-            return
+ 
+    def is_message_for_me():
+        async def predicate(ctx):
+            # Only return true if command didn't come from the bot and is in correct channel
+            return not ctx.author.id == ctx.bot.user.id and ctx.channel.id == channelToListenOn
+        return commands.check(predicate)
+        
+    def user_has_no_existing_tasks():
+        async def predicate(ctx):
+            # Return true if user ID is not already in the task list
+            if not ctx.author.id in self.currentTasks.keys() and not ctx.author.id in self.currentLowPriorityTasks.keys():
+               return true
+            # Otherwise notify and return false to abort the command
+            await ctx.channel.send(f'{ctx.author.mention} has already submitted a pending task (please try and submit it again later): {self.currentTasks[ctx.author.id]}')   
+            return false              
+        return commands.check(predicate)
+    
+    def message_has_valid_yaml_attachment():
+        async def predicate(ctx):
+            # Message should only have one attachment, and it shoud be a yaml
+            return len(ctx.message.attachments) == 1 and ctx.message.attachments[0].filename.endswith(".yaml")
+        return commands.check(predicate)    
+ 
+    # !regen command
+    @self.command()
+    @is_message_for_me()
+    @user_has_no_existing_tasks()
+    async def regen(ctx, args):
+        # Add the task to the queue
+        self.currentTasks[ctx.author.id] = args[0]
+        
+        # Give feedback
+        print(f'Rerunning {args[0]} submitted from {ctx.author}')
+        await ctx.channel.send(f'Rerunning {args[0]} submitted from {ctx.author}')
+        return
+     
+    # !generate command
+    @self.command()
+    @is_message_for_me()
+    @user_has_no_existing_tasks()
+    @message_has_valid_yaml_attachment()
+    async def generate(ctx, args)
+        attachment = ctx.message.attachments[0]
         locToSaveTo = path.join(basePath,attachment.filename)
+
         # If the named merge already has been run, respond with an error
         if path.exists(locToSaveTo):
-            await message.channel.send(f'The file {attachment.filename} already has been merged before. Please choose a different name {message.author.mention}.')
+            await ctx.channel.send(f'The file {attachment.filename} already has been merged before. Please choose a different name {ctx.author.mention}.')
             return
+            
         # If the file contains gated words, then don't do the merge unless the user has the designated role and even then run at lower priority
         data = (await attachment.read()).decode("utf-8")
         isGated = any(word in data.lower() for word in gatedWords)
-        if isGated and not any(role.id == gatedWordsRole for role in message.author.roles):
-            await message.channel.send(gatedWordsError)
+        if isGated and not any(role.id == gatedWordsRole for role in ctx.author.roles):
+            await ctx.channel.send(gatedWordsError)
             return
+            
         # If the file contains banned words, don't run it
         if any(word in data.lower() for word in forbiddenWords):
-            await message.channel.send(f'The file {attachment.filename} contains forbidden words and cannot be run.')
+            await ctx.channel.send(f'The file {attachment.filename} contains forbidden words and cannot be run.')
             return
 
         # Save the attachment
@@ -95,13 +109,43 @@ class KMergeBoxBot(discord.Client):
 
         # Add merge job to queue and then respond to requester
         if isGated:
-            self.currentLowPriorityTasks[message.author.id] = attachment.filename
+            self.currentLowPriorityTasks[ctx.author.id] = attachment.filename
         else:
-            self.currentTasks[message.author.id] = attachment.filename
+            self.currentTasks[ctx.author.id] = attachment.filename
 
-        print(f'Attachment submitted from {message.author}: {message.content} and saved to {locToSaveTo}')
-        await message.channel.send(f'Task submitted for {message.author.mention}: {attachment.filename}')
-
+        print(f'Attachment submitted from {ctx.author}: {ctx.message.content} and saved to {locToSaveTo}')
+        await ctx.channel.send(f'Task submitted for {ctx.author.mention}: {attachment.filename}')
+        return
+        
+    
+    # @self.command()
+    # @is_message_for_me()
+    # async def replace(ctx, args)
+        # return
+    
+    # @self.command()
+    # @is_message_for_me()
+    # async def remove(ctx, args)
+        # return
+    
+    # @self.command()
+    # @is_message_for_me()
+    # async def hf(ctx, args)
+        # return
+            
+    @self.command()
+    @is_message_for_me()
+    async def status(ctx, args)
+        if self.currentlyCleaning:
+            await ctx.channel.send(f'Currently running a cleanup job...')
+        else if self.currentlyMerging:
+            ## TODO: get current job info
+            await ctx.channel.send(f'Currently running a merge...')
+        else:
+            await ctx.channel.send(f'Currently idle...')
+        return 
+    
+ 
     @tasks.loop(seconds=10)
     async def runMerges(self):
         # Check disk space free
@@ -183,5 +227,5 @@ class KMergeBoxBot(discord.Client):
 intents = discord.Intents.default()
 intents.message_content = True
 
-client = KMergeBoxBot(intents=intents)
-client.run(apiKey)
+bot = KMergeBoxBot(command_prefix='!', intents=intents)
+bot.run(apiKey)
