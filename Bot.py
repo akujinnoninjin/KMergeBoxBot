@@ -29,10 +29,10 @@ os.chdir(basePath)
 class KMergeBoxBot(discord.Client):
     def __init__(self, command_prefix, intents, db_cursor):
         super().__init__(command_prefix=command_prefix, intents=intents)
-        self.db_cursor = db_cursor
+        self.dbCursor = db_cursor
         
         #Encryption Setup
-        self.cipher_suite = Fernet(encryptionKey)
+        self.cipherSuite = Fernet(encryptionKey)
         
     # List of current / ongoing tasks
     currentTasks = {}
@@ -68,7 +68,7 @@ class KMergeBoxBot(discord.Client):
     def message_has_valid_yaml_attachment():
         async def predicate(ctx):
             # Message should only have one attachment, and it shoud be a yaml
-            return len(ctx.message.attachments) == 1 and ctx.message.attachments[0].filename.endswith(".yaml")
+            return len(ctx.message.attachments) == 1 and ctx.message.attachments[0].filename.lower().endswith(".yaml")
         return commands.check(predicate)    
  
     # !regen command
@@ -85,6 +85,7 @@ class KMergeBoxBot(discord.Client):
         return
      
     # !generate command
+    # Takes an attachment and an optional "update" flag to overwrite an existing yaml if the user owns it. 
     @self.command()
     @is_message_for_me()
     @user_has_no_existing_tasks()
@@ -92,9 +93,23 @@ class KMergeBoxBot(discord.Client):
     async def generate(ctx, args)
         attachment = ctx.message.attachments[0]
         locToSaveTo = path.join(basePath,attachment.filename)
+        jobName = attachment.filename.rsplit(".", 1)[0]
+        updateAllowed = False
+        
+        # If user has requested to update the existing file
+        if args[0].lower() == "update"
+            # Lookup who owns the job
+            jobOwner = self.dbCursor.execute("SELECT user_id FROM job_history WHERE job_name = ?", (jobName))
+            # If they own don't own it, deny them
+            if jobOwner != None and jobOwner != ctx.author.id:
+                await ctx.channel.send(f'Cannot update {attachment.filename}, it belongs to {get_user(jobOwner)}.') 
+                return
+            updateAllowed = True
+
+        ## ISSUE: Existing YAML will have jobOwner None, allowing *anyone* to overwrite them with Update, and take ownership of them in the process.
 
         # If the named merge already has been run, respond with an error
-        if path.exists(locToSaveTo):
+        if path.exists(locToSaveTo) and not updateAllowed:
             await ctx.channel.send(f'The file {attachment.filename} already has been merged before. Please choose a different name {ctx.author.mention}.')
             return
             
@@ -112,6 +127,9 @@ class KMergeBoxBot(discord.Client):
 
         # Save the attachment
         await attachment.save(locToSaveTo)
+        
+        # Add the job to the database for the user
+        self.dbCursor.execute('INSERT INTO job_history (user_id, job_name) VALUES (?, ?)', (ctx.author.id, attachment.filename))
 
         # Add merge job to queue and then respond to requester
         if isGated:
@@ -125,11 +143,6 @@ class KMergeBoxBot(discord.Client):
         
     # @self.command()
     # @is_message_for_me()
-    # async def replace(ctx, args)
-        # return
-    
-    # @self.command()
-    # @is_message_for_me()
     # async def remove(ctx, args)
         # return
     
@@ -137,7 +150,9 @@ class KMergeBoxBot(discord.Client):
     # @is_message_for_me()
     # async def hf(ctx, args)
         # return
-        
+    
+    #!hftoken command
+    #Takes one argument (the hf token), encrypts it, and adds it to the database. Only works over DMs.
     @self.command()
     @dm_only()
     async def hftoken(ctx, args)
@@ -149,11 +164,11 @@ class KMergeBoxBot(discord.Client):
             return
         
         # Encrypt and store the hf token in the database, keyed to the user's ID; overwriting existing 
-        encrypted_token = cipher_suite.encrypt(args[0].encode())
-        self.db_cursor.execute('INSERT OR REPLACE INTO hf_tokens (user_id, hf_token) VALUES (?, ?)', (ctx.author.id, encrypted_token))
+        encryptedToken = cipherSuite.encrypt(args[0].encode())
+        self.dbCursor.execute('INSERT OR REPLACE INTO hf_tokens (user_id, hf_token) VALUES (?, ?)', (ctx.author.id, encryptedToken))
         
         # Notify user, with a sanity check that converts back the stored data to ensure it looks right. Then remove the value after 15 seconds.
-        message = await ctx.author.send(f"HF token for <@{ctx.author.id}> updated to {cipher_suite.decrypt(encrypted_token).decode} and encrypted.")
+        message = await ctx.author.send(f"HF token for <@{ctx.author.id}> updated to {cipherSuite.decrypt(encryptedToken).decode} and encrypted.")
         await asyncio.sleep(15)
         await message.edit(f"HF token for <@{ctx.author.id}> updated to <censored> and encrypted.")
         return
@@ -227,7 +242,7 @@ class KMergeBoxBot(discord.Client):
             self.currentJob = ()
             return
         else:
-            nameWithoutExt = firstTask[1].replace('.yaml', '')
+            nameWithoutExt = firstTask[1].rsplit(".", 1)[0]
             self.currentJob = ("running merge: " + nameWithoutExt, datetime.now().strftime("%m-%d %H:%M:%S"))
             print(f'Now {self.currentJob[0]}, started at {self.currentJob[1]}')
         
@@ -266,11 +281,15 @@ c = conn.cursor()
 
 # Create table if it doesn't exist
 c.execute('''CREATE TABLE IF NOT EXISTS hf_tokens
-             (user_id INT PRIMARY KEY, hf_token TEXT)''')
-c.execute('''CREATE TABLE IF NOT EXISTS previous_jobs
-             (user_id INT FOREIGN KEY, job_name TEXT)''')
-                          
-             
+             (user_id INT PRIMARY KEY,
+              hf_token TEXT)''')
+c.execute('''CREATE TABLE IF NOT EXISTS job_history
+             (job_id INT PRIMARY KEY AUTOINCREMENT,
+              user_id INT,
+              job_name TEXT,
+              FOREIGN KEY(user_id) REFERENCES hf_tokens(user_id)
+              ON DELETE CASCADE)''')
+
 conn.commit()
     
 # Runs the merge bot with the provided API key
